@@ -1,0 +1,273 @@
+name: Build Transmission
+
+permissions: write-all
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Transmission version to build'
+        required: false
+        default: 'all'
+        type: choice
+        options:
+          - 'all'
+          - '4.0.3'
+          - '4.0.4'
+          - '4.0.5'
+          - '4.0.6'
+          - '4.1.0-beta2'
+
+jobs:
+  setup-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generating matrix
+        id: generate
+        run: |
+          pip3 install --upgrade pyyaml
+          echo "Generating matrix..."
+          MATRIX=$(python3 matrix.py)
+          echo "$MATRIX" > matrix.json
+          echo "matrix<<EOF" >> $GITHUB_ENV
+          cat matrix.json >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      - name: Setup matrix
+        id: set
+        uses: druzsan/setup-matrix@v2
+        with:
+          matrix: |
+            ${{ env.matrix }}
+
+  build:
+    name: v${{ matrix.version }} (${{ matrix.os }})
+    needs: setup-matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+    container:
+      image: ${{ 
+        startsWith(matrix.os, 'debian-') && (matrix.os == 'debian-11' && 'debian:bullseye' || matrix.os == 'debian-12' && 'debian:bookworm' || 'debian:bookworm') ||
+        startsWith(matrix.os, 'ubuntu-') && format('{0}:{1}', 'ubuntu', matrix.os == 'ubuntu-latest' && 'noble' || matrix.os == 'ubuntu-22.04' && '22.04' || matrix.os == 'ubuntu-24.04' && '24.04' || matrix.os) || '' }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      COMMITTER_NAME: ${{ secrets.COMMITTER_NAME }}
+      COMMITTER_EMAIL: ${{ secrets.COMMITTER_EMAIL }}
+      STABILITY: ${{ matrix.stability }}
+
+    steps:
+      - name: Setup variables
+        id: vars
+        run: |
+          echo "build_script=tools/packages/transmission/build.sh" >> $GITHUB_OUTPUT
+          echo "package_name=transmission-${{ matrix.stability }}" >> $GITHUB_OUTPUT
+          echo "metadata_script=tools/generate_metadata.sh" >> $GITHUB_OUTPUT
+          echo "control_file=tools/packages/transmission/control" >> $GITHUB_OUTPUT
+          echo "package_script=tools/generate_package.sh" >> $GITHUB_OUTPUT
+          echo "temp_dir=/tmp/transmission-build/install" >> $GITHUB_OUTPUT
+          for script in $(find tools/ -name "*.sh"); do
+            chmod +x $script
+          done
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Checkout tools repository
+        uses: actions/checkout@v4
+        with:
+          repository: MediaEase-binaries/tools
+          path: tools
+
+      - name: Update APT
+        run: |
+          apt-get update
+          apt-get install -y apt-transport-https rsync lsb-release curl wget git gzip util-linux \
+            dirmngr software-properties-common gnupg2 ca-certificates gpg-agent dos2unix nfs-common \
+            jq sudo debconf-utils build-essential checkinstall libnss3-tools nano zip \
+            unzip ssl-cert openssl libfcgi0ldbl libtool libcppunit-dev libssl-dev cmake \
+            zlib1g-dev libbz2-dev libreadline-dev libcairo2-dev libcurl4-openssl-dev libgirepository1.0-dev \
+            libncurses5-dev libncursesw5-dev xz-utils tk-dev liblzma-dev \
+            autoconf-archive debian-keyring debian-archive-keyring libicu-dev libgeoip-dev \
+            intltool closure-compiler libnotify4 librsvg2-common xdg-utils libnatpmp-dev libminiupnpc-dev
+
+      - name: Update control file
+        run: |
+          sed -i "s/^Version:.*/Version: ${{ matrix.version }}-1build1/" ${{ steps.vars.outputs.control_file }}
+          sed -i "s/^Package:.*/Package: ${{ steps.vars.outputs.package_name }}/" ${{ steps.vars.outputs.control_file }}
+          sed -i "s/^Maintainer:.*/Maintainer: ${{ secrets.COMMITTER_NAME }} <${{ secrets.COMMITTER_EMAIL }}>/" ${{ steps.vars.outputs.control_file }}
+      - name: Build Transmission
+        id: build
+        run: |
+          chmod +x ${{ steps.vars.outputs.build_script }}
+          ./${{ steps.vars.outputs.build_script }} ${{ matrix.version }}
+          echo "compiled=true" >> $GITHUB_OUTPUT
+
+      - name: Generate metadata
+        if: steps.build.outputs.compiled == 'true'
+        run: |
+          mkdir -p artifacts
+          find . -name "transmission-*.deb" -exec mv {} artifacts/ \;
+          cd artifacts
+          deb_file=$(basename "$(find . -name "transmission-*.deb" | head -1)")
+          codename=$(lsb_release -cs)
+          distro=$(lsb_release -is | tr '[:upper:]' '[:lower:]')
+          os="$distro-$codename"
+          echo "Generating metadata for DEB file: $deb_file"
+          ../${{ steps.vars.outputs.metadata_script }} \
+            --category "transmission" \
+            --tag "${{ matrix.stability }}" \
+            --version "${{ matrix.version }}" \
+            --os "${codename}" \
+            "$deb_file"
+          ls -l "$(basename "$deb_file" .deb).json"
+
+      - name: Upload as Artifact
+        if: steps.build.outputs.compiled == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: transmission-${{ matrix.version }}-${{ matrix.os }}
+          path: artifacts/*
+          retention-days: 7
+
+  release:
+    name: Create Releases
+    needs: build
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        version: ['4.0.3', '4.0.4', '4.0.5', '4.0.6', '4.1.0-beta.2']
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Download artifacts for this version
+        uses: actions/download-artifact@v4
+        with:
+          path: downloaded_artifacts
+          pattern: transmission-*${{ matrix.version }}*
+      
+      - name: Prepare release assets
+        id: prepare
+        run: |
+          mkdir -p release_assets
+          find downloaded_artifacts -type f \
+            \( -name "transmission-*${{ matrix.version }}*.deb" -o \
+              -name "transmission-*${{ matrix.version }}*.json" \) \
+            -exec cp {} release_assets/ \;
+          TEMP_DIR=$(mktemp -d)
+          PACKAGES_TABLE="$TEMP_DIR/packages.md"
+          CONFIG_TABLE="$TEMP_DIR/config.md"
+          {
+            echo "| Package | OS | Stability |"
+            echo "| ------- | -- | --------- |"
+            for f in release_assets/*.deb; do
+              if [ -f "$f" ]; then
+                pkg=$(basename "$f")
+                os=$(echo "$pkg" | grep -o "debian-[[:alnum:]]*\|ubuntu-[[:alnum:]]*" | head -1)
+                distro_version=$(echo "$os" | sed 's/debian-/Debian /;s/ubuntu-/Ubuntu /')
+                stability=$(echo "$pkg" | grep -o "\-stable_\|\-oldstable_\|\-next_" | sed 's/^-//;s/_$//')                
+                echo "| $pkg | $distro_version | $stability |"
+              fi
+            done
+          } > "$PACKAGES_TABLE"
+
+          {
+            cmake_cmd='-DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DBUILD_SHARED_LIBS=OFF -DENABLE_GTK=OFF -DENABLE_CLI=ON -DENABLE_UTILS=ON -DENABLE_DAEMON=ON -DINSTALL_WEB=ON -DENABLE_NLS=ON -DINSTALL_LIB=ON -DENABLE_QT=OFF -DENABLE_MAC=OFF -DENABLE_TESTS=OFF -DUSE_SYSTEM_MINIUPNPC=ON -DUSE_SYSTEM_NATPMP=ON'
+            echo "| Build Configuration |"
+            echo "| ------------------ |"
+            echo "| \`${cmake_cmd}\` |"
+          } > "$CONFIG_TABLE"
+          
+          echo "packages_table<<EOF" >> $GITHUB_OUTPUT
+          cat "$PACKAGES_TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          echo "config_table<<EOF" >> $GITHUB_OUTPUT
+          cat "$CONFIG_TABLE" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "Files prepared for release:"
+          ls -la release_assets/
+          rm -rf "$TEMP_DIR"
+          if [[ ${{ matrix.version }} == *"beta"* ]]; then
+            echo "prerelease=true" >> $GITHUB_OUTPUT
+          else
+            echo "prerelease=false" >> $GITHUB_OUTPUT
+          fi
+          if [[ -z "$(ls release_assets/*.deb 2>/dev/null)" ]]; then
+            echo "skip_release=true" >> $GITHUB_OUTPUT
+            echo "No packages to release"
+            ls -lah release_assets/
+          else
+            echo "skip_release=false" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Create Release
+        if: steps.prepare.outputs.skip_release == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ matrix.version }}
+          name: Transmission ${{ matrix.version }}
+          files: |
+            release_assets/*
+          draft: false
+          prerelease: ${{ steps.prepare.outputs.prerelease }}
+          generate_release_notes: true
+          body: |
+            # Transmission v${{ matrix.version }}
+
+            Pre-built Transmission BitTorrent client packages for various Linux distributions.
+
+            ## 🎯 Features
+
+            - Pre-compiled binaries ready to use
+            - Multiple distribution support
+            - Automated builds via GitHub Actions
+            - JSON metadata for automated installations
+
+            ## 📦 Available Packages
+
+            ${{ steps.prepare.outputs.packages_table }}
+
+            ## 🔧 Build Configuration
+
+            ${{ steps.prepare.outputs.config_table }}
+
+            ## 📋 Installation
+
+            ### Manual Installation
+            1. Download the appropriate .deb package for your distribution
+            2. Install using: `sudo dpkg -i package_name.deb`
+            3. Fix any dependencies if needed: `sudo apt-get install -f`
+
+            ## 🔍 Package Details
+
+            The packages are built with:
+            - System-wide installation in `/opt/MediaEase/.binaries/installed/transmission-${STABILITY}_${VERSION}`
+            - Web interface support
+            - JSON-RPC API support
+
+            ## 📄 Metadata
+
+            Each package is accompanied by its JSON metadata file containing:
+            - Package information
+            - Checksums
+            - Dependencies
+            - Build configuration
+            - Distribution details
+
+            ## 📝 License
+
+            Transmission is distributed under the [GNU General Public License v2](https://www.gnu.org/licenses/old-licenses/gpl-2.0.html).
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
